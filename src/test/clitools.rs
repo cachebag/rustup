@@ -12,7 +12,7 @@ use std::{
     mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Child, Command, ExitStatus},
     string::FromUtf8Error,
     sync::{Arc, LazyLock, RwLock, RwLockWriteGuard},
     thread,
@@ -973,13 +973,14 @@ impl CliTestContext {
         Self { config, _test_dir }
     }
 
-    /// Run a rustup command until it reaches `checkpoint`, then terminate it
-    /// without giving destructors an opportunity to run.
-    pub fn kill_at<S: AsRef<OsStr> + Clone + Debug>(
+    /// Run a rustup command until it reaches `checkpoint` and keep it parked
+    /// there, e.g. to observe or race the paused operation from another
+    /// process. The returned guard kills the command when dropped.
+    pub fn spawn_at<S: AsRef<OsStr> + Clone + Debug>(
         &self,
         checkpoint: &str,
         args: impl AsRef<[S]>,
-    ) -> ExitStatus {
+    ) -> ParkedChild {
         let marker = checkpoint_path(&self.config.test_root_dir, checkpoint);
         if let Err(error) = fs::remove_file(&marker)
             && error.kind() != io::ErrorKind::NotFound
@@ -1000,36 +1001,46 @@ impl CliTestContext {
         );
         cmd.env(CHECKPOINT_ENV, checkpoint);
 
-        let _lock = CMD_LOCK.read().unwrap();
-        let mut child = cmd
-            .spawn()
-            .expect("failed to start command for checkpoint test");
+        // The lock covers the spawn itself. It must not be held while the
+        // child stays parked: a writer queued behind it would then block
+        // every command spawned in the meantime, including the ones a test
+        // wants to run against the parked process.
+        let child = {
+            let _lock = CMD_LOCK.read().unwrap();
+            cmd.spawn()
+                .expect("failed to start command for checkpoint test")
+        };
+        let mut parked = ParkedChild { child: Some(child) };
 
         let deadline = Instant::now() + StdDuration::from_secs(10);
         loop {
             if matches!(fs::read_to_string(&marker), Ok(contents) if contents == checkpoint) {
-                break;
+                break parked;
             }
-            if let Some(status) = child
+            if let Some(status) = parked
+                .child
+                .as_mut()
+                .unwrap()
                 .try_wait()
                 .expect("failed to query checkpoint test command")
             {
                 panic!("command exited before reaching checkpoint {checkpoint:?}: {status}");
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
                 panic!("timed out waiting for checkpoint {checkpoint:?}");
             }
             thread::sleep(StdDuration::from_millis(10));
         }
+    }
 
-        child
-            .kill()
-            .expect("failed to terminate command at checkpoint");
-        child
-            .wait()
-            .expect("failed to reap command after checkpoint")
+    /// Run a rustup command until it reaches `checkpoint`, then terminate it
+    /// without giving destructors an opportunity to run.
+    pub fn kill_at<S: AsRef<OsStr> + Clone + Debug>(
+        &self,
+        checkpoint: &str,
+        args: impl AsRef<[S]>,
+    ) -> ExitStatus {
+        self.spawn_at(checkpoint, args).kill()
     }
 
     /// Move the dist server to the specified scenario and restore it
@@ -1109,6 +1120,35 @@ impl Drop for WorkDirGuard<'_> {
 }
 
 #[must_use]
+/// A rustup command spawned by [`CliTestContext::spawn_at`], parked at a
+/// checkpoint. Killed on drop unless [`ParkedChild::kill`] was called first.
+pub struct ParkedChild {
+    child: Option<Child>,
+}
+
+impl ParkedChild {
+    /// Terminate the parked command without giving destructors an opportunity
+    /// to run, then reap it.
+    pub fn kill(mut self) -> ExitStatus {
+        let mut child = self.child.take().unwrap();
+        child
+            .kill()
+            .expect("failed to terminate command at checkpoint");
+        child
+            .wait()
+            .expect("failed to reap command after checkpoint")
+    }
+}
+
+impl Drop for ParkedChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct DistDirGuard<'a> {
     inner: &'a mut CliTestContext,
 }
