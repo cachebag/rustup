@@ -1382,6 +1382,7 @@ pub(crate) fn cleanup_self_updater(process: &Process) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::collections::HashMap;
 
@@ -1443,3 +1444,6 @@ info: default host tuple is {0}
         assert!(cargo_home.exists());
     }
 }
+
+#[cfg(feature = "test")]
+pub const CHECKPOINT_SELF_REPLACE_READY: &str = "self-replace-ready";
