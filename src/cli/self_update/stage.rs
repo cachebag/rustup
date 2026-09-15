@@ -1,12 +1,14 @@
 use std::{
     env::consts::EXE_SUFFIX,
     fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
+use tempfile::TempPath;
 use tracing::warn;
 
 use super::install_proxies;
@@ -64,18 +66,16 @@ impl SelfUpdateLock {
 
     /// Installs the running executable as `$CARGO_HOME/bin/rustup` and refreshes its proxies.
     pub(super) fn install_bins(&self, process: &Process) -> anyhow::Result<()> {
+        self.install_bins_from(&utils::current_exe()?, process)
+    }
+
+    fn install_bins_from(&self, this_exe_path: &Path, process: &Process) -> anyhow::Result<()> {
         let bin_path = process.cargo_home()?.join("bin");
-        let this_exe_path = utils::current_exe()?;
         let rustup_path = bin_path.join(format!("rustup{EXE_SUFFIX}"));
 
         utils::ensure_dir_exists("bin", &bin_path)?;
-        // NB: Even on Linux we can't just copy the new binary over the (running)
-        // old binary; we must unlink it first.
-        if rustup_path.exists() {
-            utils::remove_file("rustup-bin", &rustup_path)?;
-        }
-        utils::copy_file_symlink_to_source(&this_exe_path, &rustup_path)?;
-        utils::make_executable(&rustup_path)?;
+        let pending = stage_pending_binary(this_exe_path, &bin_path)?;
+        replace_rustup_binary(&pending, &rustup_path)?;
         install_proxies(process)
     }
 
@@ -130,6 +130,48 @@ pub(super) fn cleanup(process: &Process) -> anyhow::Result<()> {
     cleanup_at(process, SystemTime::now())
 }
 
+fn stage_pending_binary(this_exe_path: &Path, bin_path: &Path) -> anyhow::Result<TempPath> {
+    let pending = tempfile::Builder::new()
+        .prefix(PENDING_BINARY_PREFIX)
+        .tempfile_in(bin_path)
+        .context("failed to reserve a pending rustup binary")?
+        .into_temp_path();
+
+    // TempPath reserves a unique name, but preserving a source symlink requires
+    // an absent destination rather than an existing empty file.
+    fs::remove_file(&pending).context("failed to prepare the pending rustup path")?;
+    utils::copy_file_symlink_to_source(this_exe_path, &pending)?;
+    utils::make_executable(&pending)?;
+    if !fs::symlink_metadata(&pending)?.file_type().is_symlink() {
+        OpenOptions::new()
+            .write(true)
+            .open(&pending)
+            .and_then(|file| file.sync_all())
+            .context("failed to sync the pending rustup binary")?;
+    }
+
+    Ok(pending)
+}
+
+fn replace_rustup_binary(replacement: &Path, rustup: &Path) -> anyhow::Result<()> {
+    // `rename` replaces an existing destination in one step on every platform,
+    // so a failure here leaves the installed rustup untouched. The copy fallback
+    // is disabled because it would break that guarantee; it is never needed,
+    // since the replacement lives in the same directory as the target.
+    utils::rename("rustup", replacement, rustup, false)?;
+    // Make the rename durable. Windows has no directory handle to sync.
+    #[cfg(unix)]
+    File::open(
+        rustup
+            .parent()
+            .context("installed rustup binary has no parent directory")?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .context("failed to sync rustup binary directory")?;
+
+    Ok(())
+}
+
 fn cleanup_at(process: &Process, now: SystemTime) -> anyhow::Result<()> {
     if let Some(lock) = SelfUpdateLock::try_acquire(process)? {
         let updater = lock.updater_path();
@@ -145,9 +187,31 @@ fn cleanup_at(process: &Process, now: SystemTime) -> anyhow::Result<()> {
         }
     }
 
-    let updater = process
-        .cargo_home()?
-        .join(format!("bin/rustup-init{EXE_SUFFIX}"));
+    let bin = process.cargo_home()?.join("bin");
+    match fs::read_dir(&bin) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PENDING_BINARY_PREFIX)
+                    && is_stale(&path, now)
+                {
+                    utils::remove_file_best_effort("pending rustup binary", &path);
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                "could not inspect pending rustup binaries in {}: {error}",
+                bin.display()
+            );
+        }
+    }
+
+    let updater = bin.join(format!("rustup-init{EXE_SUFFIX}"));
     // Legacy updaters have no result marker, and an older rustup process may
     // still own the shared path.
     if is_stale(&updater, now) {
@@ -211,6 +275,7 @@ impl Marker {
 const SELF_UPDATE_DIRECTORY: &str = "self-update";
 const SELF_UPDATE_LOCK_FILE: &str = "self-update.lock";
 const STAGE_ENV: &str = "RUSTUP_SELF_UPDATE_STAGE";
+const PENDING_BINARY_PREFIX: &str = ".rustup-pending-";
 const ABANDONED_UPDATE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(test)]
@@ -263,6 +328,47 @@ mod tests {
         ));
         drop(lock);
         contender.try_lock().unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_bins_preserves_existing_rustup_if_source_disappears() {
+        let root = test_dir().unwrap();
+        let process = test_process(root.path());
+        let rustup = root.path().join(format!("cargo/bin/rustup{EXE_SUFFIX}"));
+        fs::create_dir_all(rustup.parent().unwrap()).unwrap();
+        fs::write(&rustup, "old rustup").unwrap();
+
+        SelfUpdateLock::acquire(&process.process)
+            .unwrap()
+            .install_bins_from(&root.path().join("missing-updater"), &process.process)
+            .unwrap_err();
+
+        assert_eq!(fs::read_to_string(rustup).unwrap(), "old rustup");
+    }
+
+    #[test]
+    fn failed_replace_preserves_existing_rustup() {
+        let root = test_dir().unwrap();
+        let rustup = root.path().join(format!("rustup{EXE_SUFFIX}"));
+        fs::write(&rustup, "old rustup").unwrap();
+
+        replace_rustup_binary(&root.path().join("missing"), &rustup).unwrap_err();
+
+        assert_eq!(fs::read_to_string(rustup).unwrap(), "old rustup");
+    }
+
+    #[test]
+    fn replace_publishes_pending_rustup() {
+        let root = test_dir().unwrap();
+        let rustup = root.path().join(format!("rustup{EXE_SUFFIX}"));
+        let pending = root.path().join("pending");
+        fs::write(&rustup, "old rustup").unwrap();
+        fs::write(&pending, "new rustup").unwrap();
+
+        replace_rustup_binary(&pending, &rustup).unwrap();
+
+        assert_eq!(fs::read_to_string(rustup).unwrap(), "new rustup");
+        assert!(!pending.exists());
     }
 
     #[tokio::test]
@@ -378,6 +484,28 @@ mod tests {
         )
         .unwrap();
         assert!(!updater.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_abandoned_pending_binary() {
+        let root = test_dir().unwrap();
+        let process = test_process(root.path());
+        let pending = root
+            .path()
+            .join("cargo/bin")
+            .join(format!("{PENDING_BINARY_PREFIX}orphan"));
+        fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        fs::write(&pending, "").unwrap();
+
+        cleanup_at(&process.process, SystemTime::now()).unwrap();
+        assert!(pending.exists());
+
+        cleanup_at(
+            &process.process,
+            SystemTime::now() + ABANDONED_UPDATE_AGE + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!pending.exists());
     }
 
     fn test_process(root: &Path) -> TestProcess {
